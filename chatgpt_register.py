@@ -900,6 +900,7 @@ class ChatGPTRegister:
         return token
 
     def signin(self, email: str, csrf: str) -> str:
+        """登录（补全 sec-fetch-* headers）"""
         url = f"{self.BASE}/api/auth/signin/openai"
         params = {
             "prompt": "login", "ext-oai-did": self.device_id,
@@ -910,6 +911,8 @@ class ChatGPTRegister:
         r = self.session.post(url, params=params, data=form_data, headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json", "Referer": f"{self.BASE}/", "Origin": self.BASE,
+            "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin", "sec-fetch-user": "?1",
         })
         data = r.json()
         authorize_url = data.get("url", "")
@@ -919,23 +922,57 @@ class ChatGPTRegister:
         return authorize_url
 
     def authorize(self, url: str) -> str:
+        """授权（补全 sec-fetch-* headers）"""
         r = self.session.get(url, headers={
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": f"{self.BASE}/", "Upgrade-Insecure-Requests": "1",
+            "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "cross-site", "sec-fetch-user": "?1",
         }, allow_redirects=True)
         final_url = str(r.url)
         self._log("3. Authorize", "GET", url, r.status_code, {"final_url": final_url})
         return final_url
 
     def register(self, email: str, password: str):
+        """注册用户（改进：添加 Sentinel Token + 跟随 continue_url）"""
         url = f"{self.AUTH}/api/accounts/user/register"
         headers = {"Content-Type": "application/json", "Accept": "application/json",
-                    "Referer": f"{self.AUTH}/create-account/password", "Origin": self.AUTH}
+                    "Referer": f"{self.AUTH}/create-account/password", "Origin": self.AUTH,
+                    "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin", "sec-fetch-user": "?1"}
         headers.update(_make_trace_headers())
+
+        # 添加 Sentinel Token 绕过 PoW 反机器人校验
+        sentinel_token = build_sentinel_token(
+            self.session, self.device_id, flow="user_register",
+            user_agent=self.ua, sec_ch_ua=self.sec_ch_ua, impersonate=self.impersonate
+        )
+        if sentinel_token:
+            headers["openai-sentinel-token"] = sentinel_token
+
         r = self.session.post(url, json={"username": email, "password": password}, headers=headers)
         try: data = r.json()
         except Exception: data = {"text": r.text[:500]}
         self._log("4. Register", "POST", url, r.status_code, data)
+
+        # 跟随 continue_url 绕过流程状态机校验
+        if r.status_code == 200 and isinstance(data, dict):
+            continue_url = data.get("continue_url", "")
+            if continue_url:
+                self._print(f"[Register] 跟随 continue_url: {continue_url[:80]}")
+                if continue_url.startswith("/"):
+                    continue_url = f"{self.AUTH}{continue_url}"
+                try:
+                    follow_r = self.session.get(continue_url, headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": f"{self.AUTH}/create-account/password",
+                        "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
+                        "sec-fetch-site": "same-origin", "sec-fetch-user": "?1",
+                    }, allow_redirects=True)
+                    self._print(f"[Register] continue_url 跟随完成: {follow_r.status_code}")
+                except Exception as e:
+                    self._print(f"[Register] continue_url 跟随失败: {e}")
+
         return r.status_code, data
 
     def send_otp(self):
@@ -950,9 +987,12 @@ class ChatGPTRegister:
         return r.status_code, data
 
     def validate_otp(self, code: str):
+        """验证 OTP（补全 sec-fetch-* headers）"""
         url = f"{self.AUTH}/api/accounts/email-otp/validate"
         headers = {"Content-Type": "application/json", "Accept": "application/json",
-                    "Referer": f"{self.AUTH}/email-verification", "Origin": self.AUTH}
+                    "Referer": f"{self.AUTH}/email-verification", "Origin": self.AUTH,
+                    "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin", "sec-fetch-user": "?1"}
         headers.update(_make_trace_headers())
         r = self.session.post(url, json={"code": code}, headers=headers)
         try: data = r.json()
@@ -961,18 +1001,46 @@ class ChatGPTRegister:
         return r.status_code, data
 
     def create_account(self, name: str, birthdate: str):
+        """创建账号（改进：添加 Sentinel Token + 跟随 continue_url）"""
         url = f"{self.AUTH}/api/accounts/create_account"
         headers = {"Content-Type": "application/json", "Accept": "application/json",
-                    "Referer": f"{self.AUTH}/about-you", "Origin": self.AUTH}
+                    "Referer": f"{self.AUTH}/about-you", "Origin": self.AUTH,
+                    "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin", "sec-fetch-user": "?1"}
         headers.update(_make_trace_headers())
+
+        # 添加 Sentinel Token
+        sentinel_token = build_sentinel_token(
+            self.session, self.device_id, flow="create_account",
+            user_agent=self.ua, sec_ch_ua=self.sec_ch_ua, impersonate=self.impersonate
+        )
+        if sentinel_token:
+            headers["openai-sentinel-token"] = sentinel_token
+
         r = self.session.post(url, json={"name": name, "birthdate": birthdate}, headers=headers)
         try: data = r.json()
         except Exception: data = {"text": r.text[:500]}
         self._log("7. Create Account", "POST", url, r.status_code, data)
+
+        # 跟随 continue_url
         if isinstance(data, dict):
             cb = data.get("continue_url") or data.get("url") or data.get("redirect_url")
             if cb:
                 self._callback_url = cb
+                self._print(f"[CreateAccount] 跟随 continue_url: {cb[:80]}")
+                if cb.startswith("/"):
+                    cb = f"{self.AUTH}{cb}"
+                try:
+                    follow_r = self.session.get(cb, headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": f"{self.AUTH}/about-you",
+                        "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
+                        "sec-fetch-site": "same-origin", "sec-fetch-user": "?1",
+                    }, allow_redirects=True)
+                    self._print(f"[CreateAccount] continue_url 跟随完成: {follow_r.status_code}")
+                except Exception as e:
+                    self._print(f"[CreateAccount] continue_url 跟随失败: {e}")
+
         return r.status_code, data
 
     def callback(self, url: str = None):

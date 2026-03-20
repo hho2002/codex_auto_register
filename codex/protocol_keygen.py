@@ -158,6 +158,7 @@ COMMON_HEADERS = {
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
+    "sec-fetch-user": "?1",  # 补全：表示用户主动发起
 }
 
 # 页面导航请求头（用于 GET 类请求）
@@ -906,17 +907,28 @@ class ProtocolRegistrar:
         基于浏览器抓包确认的真实请求格式：
         请求体：{"username": "xxx@xxx.com", "password": "xxx"}
 
-        注意：
-        - 邮箱字段名是 'username' 而非 'email'（已通过抓包验证）
-        - 此端点可能需要 sentinel token（通过请求头传递）
+        改进：
+        - 强制添加 Sentinel Token 绕过 PoW 反机器人校验
+        - 补全 sec-fetch-* headers 模拟真实浏览器
         """
         print(f"\n🔑 [步骤2-HTTP] 注册用户: {email}")
 
         url = f"{OPENAI_AUTH_BASE}/api/accounts/user/register"
+
+        # 获取 Sentinel Token（user_register flow）
+        sentinel_token = build_sentinel_token(
+            self.session, self.device_id, flow="user_register"
+        )
+        if not sentinel_token:
+            print("  ⚠️ Sentinel token 获取失败，使用本地生成")
+            sentinel_token = self.sentinel_gen.generate_token()
+
         headers = self._build_headers(
             referer=f"{OPENAI_AUTH_BASE}/create-account/password",
-            with_sentinel=True,
+            with_sentinel=False,  # 手动添加
         )
+        headers["openai-sentinel-token"] = sentinel_token
+
         # 浏览器抓包确认的请求格式：username + password
         payload = {
             "username": email,
@@ -928,6 +940,31 @@ class ProtocolRegistrar:
 
         if resp.status_code == 200:
             print("  ✅ 注册成功")
+            # 跟随 continue_url（如果有）
+            try:
+                data = resp.json()
+                continue_url = data.get("continue_url", "")
+                if continue_url:
+                    print(f"  🔗 跟随 continue_url: {continue_url[:80]}")
+                    if continue_url.startswith("/"):
+                        continue_url = f"{OPENAI_AUTH_BASE}{continue_url}"
+                    follow_resp = self.session.get(
+                        continue_url,
+                        headers={
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "user-agent": USER_AGENT,
+                            "sec-fetch-dest": "document",
+                            "sec-fetch-mode": "navigate",
+                            "sec-fetch-site": "same-origin",
+                            "sec-fetch-user": "?1",
+                        },
+                        verify=False,
+                        timeout=30,
+                        allow_redirects=True,
+                    )
+                    print(f"  ✅ continue_url 跟随完成: {follow_resp.status_code}")
+            except Exception as e:
+                print(f"  ⚠️ 解析 continue_url 失败: {e}")
             return True
         else:
             print(f"  ❌ 失败: {resp.text[:300]}")
@@ -1000,6 +1037,8 @@ class ProtocolRegistrar:
         """
         步骤5：提交姓名 + 生日完成注册（HTTP POST）
         POST /api/accounts/create_account
+
+        改进：跟随 continue_url 绕过流程状态机校验
         """
         print(f"\n📝 [步骤5-HTTP] 创建账号（{first_name} {last_name}, {birthdate}）")
         url = f"{OPENAI_AUTH_BASE}/api/accounts/create_account"
@@ -1017,16 +1056,76 @@ class ProtocolRegistrar:
         print(f"  状态码: {resp.status_code}")
 
         if resp.status_code == 200:
+            # 解析响应，跟随 continue_url
+            try:
+                data = resp.json()
+                continue_url = data.get("continue_url", "")
+                if continue_url:
+                    print(f"  🔗 跟随 continue_url: {continue_url[:80]}")
+                    # 跟随 continue_url 完成流程状态机
+                    if continue_url.startswith("/"):
+                        continue_url = f"{OPENAI_AUTH_BASE}{continue_url}"
+                    follow_resp = self.session.get(
+                        continue_url,
+                        headers={
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "user-agent": USER_AGENT,
+                            "sec-fetch-dest": "document",
+                            "sec-fetch-mode": "navigate",
+                            "sec-fetch-site": "same-origin",
+                            "sec-fetch-user": "?1",
+                        },
+                        verify=False,
+                        timeout=30,
+                        allow_redirects=True,
+                    )
+                    print(f"  ✅ continue_url 跟随完成: {follow_resp.status_code}")
+            except Exception as e:
+                print(f"  ⚠️ 解析 continue_url 失败: {e}")
+
             print("  ✅ 账号创建完成！")
             return True
         elif resp.status_code == 403 and "sentinel" in resp.text.lower():
             print("  ⚠️ 需要 sentinel token，重试...")
             # 带 sentinel 重试
-            headers["openai-sentinel-token"] = self.sentinel_gen.generate_token()
+            sentinel_token = build_sentinel_token(
+                self.session, self.device_id, flow="create_account"
+            )
+            if sentinel_token:
+                headers["openai-sentinel-token"] = sentinel_token
+            else:
+                headers["openai-sentinel-token"] = self.sentinel_gen.generate_token()
+
             resp = self.session.post(
                 url, json=payload, headers=headers, verify=False, timeout=30
             )
             if resp.status_code == 200:
+                # 同样跟随 continue_url
+                try:
+                    data = resp.json()
+                    continue_url = data.get("continue_url", "")
+                    if continue_url:
+                        print(f"  🔗 跟随 continue_url: {continue_url[:80]}")
+                        if continue_url.startswith("/"):
+                            continue_url = f"{OPENAI_AUTH_BASE}{continue_url}"
+                        follow_resp = self.session.get(
+                            continue_url,
+                            headers={
+                                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                "user-agent": USER_AGENT,
+                                "sec-fetch-dest": "document",
+                                "sec-fetch-mode": "navigate",
+                                "sec-fetch-site": "same-origin",
+                                "sec-fetch-user": "?1",
+                            },
+                            verify=False,
+                            timeout=30,
+                            allow_redirects=True,
+                        )
+                        print(f"  ✅ continue_url 跟随完成: {follow_resp.status_code}")
+                except Exception:
+                    pass
+
                 print("  ✅ 账号创建完成（带 sentinel 重试成功）！")
                 return True
             print(f"  ❌ 重试仍失败: {resp.text[:300]}")
